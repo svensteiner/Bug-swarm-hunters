@@ -1,0 +1,1 @@
+# Bug Swarm Hunters — Adapters

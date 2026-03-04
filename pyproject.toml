@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "bug-swarm-hunters"
+version = "1.0.0"
+description = "Competing AI agents hunt for live-readiness bugs in Python projects — with a points leaderboard"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+keywords = ["bug-hunting", "multi-agent", "code-quality", "agentic", "claude-code"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/svensteiner/Bug-swarm-hunters"
+Repository = "https://github.com/svensteiner/Bug-swarm-hunters"
+Issues = "https://github.com/svensteiner/Bug-swarm-hunters/issues"
+
+[project.scripts]
+bug-hunt = "core.bug_hunter_arena:run_arena"
+
+[tool.setuptools.packages.find]
+include = ["core*", "hunters*", "adapters*"]

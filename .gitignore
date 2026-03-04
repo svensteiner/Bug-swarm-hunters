@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.bug_hunters/
+bug_hunt_proposals/
+BUG_HUNT_REPORT.md
+*.log
+.DS_Store

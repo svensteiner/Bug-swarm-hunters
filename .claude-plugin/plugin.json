@@ -1,0 +1,27 @@
+{
+  "name": "bug-swarm-hunters",
+  "version": "1.0.0",
+  "description": "Competing specialized agents hunt for live-readiness bugs in Python projects. Points leaderboard rewards confirmed finds.",
+  "author": {
+    "name": "svensteiner",
+    "url": "https://github.com/svensteiner/Bug-swarm-hunters"
+  },
+  "license": "MIT",
+  "keywords": [
+    "bug-hunting",
+    "multi-agent",
+    "code-quality",
+    "live-readiness",
+    "python",
+    "agentic",
+    "claude-code"
+  ],
+  "commands": [
+    {
+      "name": "bug-hunt",
+      "description": "Run competing bug-hunter agents on your Python project",
+      "source": "commands/bug-hunt.md"
+    }
+  ],
+  "min_claude_code_version": "1.0.0"
+}
