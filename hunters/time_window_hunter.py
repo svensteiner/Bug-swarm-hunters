@@ -130,33 +130,36 @@ class TimeWindowHunter(BaseHunter):
         return "\n".join(lines[start:end])
 
     def _assess_severity(self, line: str, context: str) -> tuple[str | None, str]:
-        """Evaluate severity. Returns (severity, note) or (None, '') if not a bug."""
+        """Bewertet Schwere. Gibt (severity, note) zurück, oder (None, '') wenn kein Bug."""
         line_lower = line.lower()
         ctx_lower = context.lower()
 
-        # DRY_RUN override already present → not a problem
+        # DRY_RUN-Override bereits vorhanden → kein Problem
         if "DRY_RUN" in context or "dry_run" in context:
             return None, ""
 
-        # Intentional daily/periodic checks → not a bug
+        # Bewusst tägliche/periodische Checks → kein Bug
         if any(kw in ctx_lower for kw in ("health_check", "daily", "fhc", "once_per", "once_a_day")):
             return None, ""
 
-        # Long cooldown + learning context = high
+        # Sehr langer Cooldown + Learning-Context = high
         if "86400" in line or "timedelta(hours=24" in line:
+            # Bug-Hunt-Arena Cooldown ist bewusst täglich → kein Bug
+            if any(kw in ctx_lower for kw in ("bug_hunt", "bug hunter", "bug-hunt")):
+                return None, ""
             if any(kw in ctx_lower for kw in ("evolution", "train", "retrain", "learn")):
-                return "high", "Evolution/learning blocked for 24h"
+                return "high", "Evolution/Learning blockiert für 24h"
             if any(kw in ctx_lower for kw in ("goal", "assess", "coach", "strategy")):
-                return "medium", "Goal/strategy assessment too infrequent"
+                return "medium", "Goal/Strategy Assessment zu selten"
             if any(kw in ctx_lower for kw in ("cooldown", "throttle", "last_")):
-                return "low", "Long cooldown — check if paper-trading-optimized"
+                return "low", "Langer Cooldown — prüfen ob paper-trading-optimiert"
 
-        # Even longer cooldowns
+        # Noch längere Cooldowns
         if "7 * 86400" in line or "604800" in line:
-            # Bug hunt itself is intentionally weekly → not a bug
+            # Bug-Hunt selbst ist bewusst wöchentlich → kein Bug
             if "bug_hunt" in ctx_lower or "bug-hunt" in ctx_lower:
                 return None, ""
-            return "high", "7-day cooldown → almost no learning in paper-trading"
+            return "high", "7-Tage-Cooldown → fast kein Lernen im Paper-Trading"
 
         return None, ""
 

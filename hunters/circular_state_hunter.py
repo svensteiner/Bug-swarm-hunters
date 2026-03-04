@@ -110,26 +110,27 @@ class CircularStateHunter(BaseHunter):
         return None
 
     # ------------------------------------------------------------------
-    # Code-Pattern Analysis (Cross-File 2-Hop Graph)
+    # Code-Pattern Analyse (Cross-File 2-Hop Graph)
     # ------------------------------------------------------------------
 
-    # Known state names in trading-bot context (adapt for your project)
+    # Bekannte State-Namen im Trading-Bot-Kontext
     _STATE_WRITERS = {"market_bias", "mcm_state", "density", "regime"}
     _STATE_READERS = {"get_current_state", "get_mcm_state", "mcm_state", "market_bias"}
 
     def _scan_code_patterns(self, root: Path) -> list[BugFinding]:
         """
-        Cross-file 2-hop graph: finds A->B->A cycles across multiple files.
+        Cross-File 2-Hop Graph: Sucht A→B→A Zyklen über mehrere Dateien.
 
-        Step 1: Which files write which state?
-        Step 2: Which files read that state AND write another?
-        Step 3: Is there an A->B->A cycle?
+        Schritt 1: Welche Dateien schreiben welchen State?
+        Schritt 2: Welche Dateien lesen diesen State UND schreiben anderen?
+        Schritt 3: Gibt es A→B→A Zyklus?
         """
         findings: list[BugFinding] = []
 
-        # Build state map: {file: {reads: set, writes: set}}
-        file_states: dict[str, dict[str, set[str]]] = {}
+        # State-Map aufbauen: {state_name: {datei: "reads"|"writes"|"both"}}
+        file_states: dict[str, dict[str, set[str]]] = {}  # file → {reads: set, writes: set}
 
+        import re as _re
         py_files = [f for f in root.rglob("*.py") if not self._should_skip(f, root)]
 
         for py_file in py_files:
@@ -141,19 +142,30 @@ class CircularStateHunter(BaseHunter):
             reads: set[str] = set()
             writes: set[str] = set()
             for line in source.splitlines():
+                stripped = line.strip()
+                # Kommentare überspringen
+                if stripped.startswith("#"):
+                    continue
+                # String-Literal-Zeilen überspringen (state-name in Anführungszeichen)
                 for reader in self._STATE_READERS:
-                    if reader in line:
-                        reads.add(reader)
+                    # Nur echte Variable-Zugriffe zählen (kein "mcm_state" als String-Literal)
+                    if _re.search(rf'\b{_re.escape(reader)}\b', stripped):
+                        # Nicht wenn es nur als String-Literal vorkommt
+                        if f'"{reader}"' not in stripped and f"'{reader}'" not in stripped:
+                            reads.add(reader)
                 for writer in self._STATE_WRITERS:
-                    if writer in line and "=" in line and "==" not in line and "#" not in line.split("=")[0]:
+                    # Echter Assignment: writer\s*= (kein ==, !=, +=, in-String)
+                    if f'"{writer}"' in stripped or f"'{writer}'" in stripped:
+                        continue  # String-Literal → kein Write
+                    if _re.search(rf'\b{_re.escape(writer)}\s*=[^=]', stripped):
                         writes.add(writer)
             if reads or writes:
                 file_states[rel] = {"reads": reads, "writes": writes}
 
-        # Find cross-file A->B->A cycles
+        # 2-Hop-Zyklen suchen: Datei A schreibt X → Datei B liest X und schreibt Y → Datei A liest Y
         findings.extend(self._find_cross_file_cycles(file_states, root))
 
-        # Single-file circular state (read + write same variable)
+        # Zusätzlich: Einzeldatei Circular-State (MCM read + write in gleicher Datei)
         for rel, states in file_states.items():
             cross = states["reads"] & states["writes"]
             if cross:
@@ -167,49 +179,57 @@ class CircularStateHunter(BaseHunter):
         file_states: dict[str, dict[str, set[str]]],
         root: Path,
     ) -> list[BugFinding]:
-        """Find A->B->A cycles in the cross-file state graph."""
-        findings: list[BugFinding] = []
-        files = list(file_states.keys())
+        """
+        Sucht Multiple-Writer State-Probleme im Cross-File State-Graph.
 
-        for file_a in files:
-            writes_a = file_states[file_a]["writes"]
-            if not writes_a:
+        Dedupliziert nach State-Variable: Ein Finding pro State, nicht pro Datei-Paar.
+        Verhindert kombinatorische Explosion bei vielen Writern.
+        """
+        findings: list[BugFinding] = []
+
+        # Welche Dateien schreiben welchen State?
+        writers_per_state: dict[str, list[str]] = {}
+        readers_per_state: dict[str, list[str]] = {}
+        for file, states in file_states.items():
+            for state in states["writes"]:
+                writers_per_state.setdefault(state, []).append(file)
+            for state in states["reads"]:
+                readers_per_state.setdefault(state, []).append(file)
+
+        # Pro State-Variable: Wenn >1 Datei schreibt UND mindestens eine auch liest → Bug
+        for state in sorted(writers_per_state):
+            writers = writers_per_state[state]
+            if len(writers) <= 1:
+                continue  # Nur ein Writer → kein Multi-Writer-Problem
+            readers = readers_per_state.get(state, [])
+            # Mindestens eine Datei schreibt UND liest denselben State
+            reader_writers = [f for f in writers if f in readers]
+            if not reader_writers:
                 continue
-            for file_b in files:
-                if file_b == file_a:
-                    continue
-                reads_b = file_states[file_b]["reads"]
-                writes_b = file_states[file_b]["writes"]
-                shared_a_to_b = writes_a & reads_b
-                if not shared_a_to_b:
-                    continue
-                reads_a = file_states[file_a]["reads"]
-                shared_b_to_a = writes_b & reads_a
-                if not shared_b_to_a:
-                    continue
-                # Real cross-file cycle found
-                cycle_desc = (
-                    f"{file_a} writes {shared_a_to_b} -> "
-                    f"{file_b} reads + writes {shared_b_to_a} -> "
-                    f"{file_a} reads (A->B->A cycle)"
-                )
-                findings.append(self._make_finding(
-                    severity="high",
-                    file_path=file_a,
-                    line_number=None,
-                    description=f"Cross-file circular state: {cycle_desc}",
-                    evidence=f"A={file_a} <-> B={file_b} via {shared_a_to_b | shared_b_to_a}",
-                    suggested_fix=(
-                        "Separate read and write access to state variables into different layers. "
-                        "MCM should be READ-ONLY. State writes should be in a single central file."
-                    ),
-                ))
+            writer_list = ", ".join(sorted(writers)[:4])
+            if len(writers) > 4:
+                writer_list += f" (+{len(writers)-4} weitere)"
+            findings.append(self._make_finding(
+                severity="high",
+                file_path=writers[0],
+                line_number=None,
+                description=(
+                    f"Multiple-Writer State: '{state}' wird von {len(writers)} Dateien "
+                    f"geschrieben und gelesen → A→B→A Deadlock möglich"
+                ),
+                evidence=f"Writers: {writer_list}",
+                suggested_fix=(
+                    f"State '{state}' sollte nur von einer zentralen Datei geschrieben werden. "
+                    "Alle anderen Dateien sollten nur lesen. "
+                    "MCM sollte READ-ONLY sein (per CLAUDE.md)."
+                ),
+            ))
         return findings
 
     def _check_single_file_circular(
         self, path: Path, root: Path, circular_states: set[str]
     ) -> list[BugFinding]:
-        """Check single file for read+write of the same state variable."""
+        """Prüft Einzeldatei auf Read+Write der gleichen State-Variable."""
         findings: list[BugFinding] = []
         try:
             source = path.read_text(encoding="utf-8", errors="ignore")
@@ -217,26 +237,33 @@ class CircularStateHunter(BaseHunter):
             return findings
         rel_path = str(path.relative_to(root))
         lines = source.splitlines()
+        import re as _re
         for state in circular_states:
             for i, line in enumerate(lines, 1):
-                if state in line and "=" in line and "==" not in line and "#" not in line.split("=")[0]:
-                    findings.append(self._make_finding(
-                        severity="medium",
-                        file_path=rel_path,
-                        line_number=i,
-                        description=(
-                            f"Possible circular state: '{state}' is read AND written "
-                            "in the same file -> A->B->A deadlock possible"
-                        ),
-                        evidence=line.strip(),
-                        suggested_fix=(
-                            "Ensure that state reads and writes are not in a feedback loop. "
-                            "MCM should be READ-ONLY."
-                        ),
-                    ))
-                    break  # Only first occurrence per state
+                stripped_line = line.strip()
+                if stripped_line.startswith("#"):
+                    continue
+                if f'"{state}"' in stripped_line or f"'{state}'" in stripped_line:
+                    continue  # String-Literal → kein echter Write
+                if not _re.search(rf'\b{_re.escape(state)}\s*=[^=]', stripped_line):
+                    continue
+                findings.append(self._make_finding(
+                    severity="medium",
+                    file_path=rel_path,
+                    line_number=i,
+                    description=(
+                        f"Possible circular state: '{state}' is read AND written "
+                        "in the same file -> A->B->A deadlock possible"
+                    ),
+                    evidence=line.strip(),
+                    suggested_fix=(
+                        "Ensure that state reads and writes are not in a feedback loop. "
+                        "MCM should be READ-ONLY."
+                    ),
+                ))
+                break  # Only first occurrence per state
         return findings
 
     def _should_skip(self, path: Path, root: Path) -> bool:
-        skip = {"venv", "venv_win", ".git", "__pycache__", "tests"}
+        skip = {"venv", "venv_win", ".git", "__pycache__", "tests", "hunters"}
         return any(part in skip for part in path.parts)
