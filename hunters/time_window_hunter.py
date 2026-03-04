@@ -68,7 +68,7 @@ class TimeWindowHunter(BaseHunter):
         return findings
 
     def _should_skip(self, path: Path, root: Path) -> bool:
-        skip = {"venv", "venv_win", ".git", "__pycache__", "tests", "node_modules"}
+        skip = {"venv", "venv_win", ".git", "__pycache__", "tests", "node_modules", "hunters"}
         return any(part in skip for part in path.parts)
 
     def _scan_file(self, path: Path, root: Path) -> list[BugFinding]:

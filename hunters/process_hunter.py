@@ -67,76 +67,119 @@ class ProcessHunter(BaseHunter):
         rel_path = str(path.relative_to(root))
         lines = source.splitlines()
 
-        # Suche Funktionen/Methoden die Processes erstellen
+        # Klassen die irgendwo terminate()/kill() aufrufen → lifecycle managed
+        class_has_cleanup: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                    if child.func.attr in _CLEANUP_METHODS:
+                        class_has_cleanup.add(node.name)
+                        break
+
+        # Funktionen prüfen — aber nicht wenn Klasse eigenes Cleanup hat
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Methode in einer Klasse mit eigenem Cleanup? → überspringen
+            parent_class = self._get_parent_class(tree, node)
+            if parent_class and parent_class in class_has_cleanup:
                 continue
             findings.extend(self._check_function(node, lines, rel_path))
 
         return findings
 
+    def _get_parent_class(self, tree: ast.AST, func: ast.FunctionDef) -> str | None:
+        """Gibt den Namen der umschließenden Klasse zurück, falls vorhanden."""
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for child in ast.walk(node):
+                if child is func:
+                    return node.name
+        return None
+
     def _check_function(
         self, func: ast.FunctionDef, lines: list[str], rel_path: str
     ) -> list[BugFinding]:
-        """Prüft eine Funktion auf Process-Erstllungen ohne Cleanup."""
+        """Prüft eine Funktion auf multiprocessing.Process ohne Cleanup."""
         findings: list[BugFinding] = []
-
-        # Sammle alle Process-Starts in dieser Funktion
-        process_starts = self._find_process_starts(func)
-        if not process_starts:
+        risky = self._find_risky_processes(func)
+        if not risky:
             return findings
 
-        # Prüfe ob Try/Finally mit Cleanup vorhanden
         has_cleanup = self._has_process_cleanup(func)
-
         if not has_cleanup:
-            for process_name, lineno in process_starts:
+            for cls_name, lineno in risky:
                 line_text = lines[lineno - 1].strip() if lineno <= len(lines) else ""
                 findings.append(self._make_finding(
                     severity="high",
                     file_path=rel_path,
                     line_number=lineno,
                     description=(
-                        f"{process_name} gestartet ohne terminate() in finally-Block "
+                        f"multiprocessing.{cls_name}() ohne terminate() in finally "
                         f"→ Zombie-Process auf Windows möglich"
                     ),
                     evidence=line_text,
                     suggested_fix=(
                         f"Umhülle mit try/finally:\n"
-                        f"  p = {process_name}(...)\n"
+                        f"  p = {cls_name}(...)\n"
                         f"  p.start()\n"
                         f"  try:\n"
                         f"      ...\n"
                         f"  finally:\n"
                         f"      p.terminate()\n"
-                        f"      p.join(timeout=5)\n"
-                        f"Oder: nutze daemon=True für Hintergrund-Threads."
+                        f"      p.join(timeout=5)"
                     ),
                 ))
-
         return findings
 
-    def _find_process_starts(
+    def _find_risky_processes(
         self, func: ast.FunctionDef
     ) -> list[tuple[str, int]]:
-        """Findet alle process.start() Aufrufe in einer Funktion."""
-        starts: list[tuple[str, int]] = []
+        """
+        Sucht multiprocessing.Process() Konstruktoren OHNE daemon=True.
+
+        Wichtig:
+        - threading.Thread(daemon=True) ist safe → ignoriert
+        - psutil.Process() liest existierende Prozesse → ignoriert
+        - multiprocessing.Process() ohne daemon → potentieller Zombie
+        """
+        risky: list[tuple[str, int]] = []
         for node in ast.walk(func):
             if not isinstance(node, ast.Call):
                 continue
-            # process.start()
-            if not isinstance(node.func, ast.Attribute):
+            cls_name = self._extract_constructor_name(node)
+            if cls_name != "Process":
                 continue
-            if node.func.attr != "start":
-                continue
-            # Prüfe ob Variable ein Process-Typ ist
-            var_name = ""
-            if isinstance(node.func.value, ast.Name):
-                var_name = node.func.value.id
-            # Ist es ein bekannter Process-Typ (in Zuweisung vorher)?
-            lineno = getattr(node, "lineno", 0)
-            starts.append((var_name or "Process", lineno))
-        return starts
+            # psutil.Process(pid) liest existierende Prozesse, erstellt keine neuen
+            if isinstance(node.func, ast.Attribute):
+                module = node.func.value
+                if isinstance(module, ast.Name) and module.id == "psutil":
+                    continue
+                if isinstance(module, ast.Attribute) and module.attr == "psutil":
+                    continue
+            # Hat daemon=True? Dann safe.
+            has_daemon = any(
+                kw.arg == "daemon"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value
+                for kw in node.keywords
+            )
+            if not has_daemon:
+                lineno = getattr(node, "lineno", 0)
+                risky.append((cls_name, lineno))
+        return risky
+
+    def _extract_constructor_name(self, node: ast.Call) -> str:
+        """Extrahiert den Klassennamen aus einem Call-Node."""
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return ""
 
     def _has_process_cleanup(self, func: ast.FunctionDef) -> bool:
         """Prüft ob eine try/finally-Cleanup-Struktur vorhanden ist."""

@@ -79,6 +79,9 @@ class DataBoundaryHunter(BaseHunter):
                     lineno = getattr(node, "lineno", None)
                     line_text = lines[lineno - 1].strip() if lineno and lineno <= len(lines) else ""
                     # Nur kritische Kontexte (len(), Indikator-Parameter)
+                    # HTTP-Statuscodes (status_code == 200) und Cache-Limits ausschließen
+                    if "status_code" in line_text or "cache" in line_text.lower():
+                        continue
                     if any(kw in line_text for kw in ("len(", "lookback", "period", "window")):
                         return self._make_finding(
                             severity="high",
