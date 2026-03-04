@@ -72,30 +72,38 @@ class DataBoundaryHunter(BaseHunter):
     def _check_node(
         self, node: ast.AST, lines: list[str], rel_path: str
     ) -> BugFinding | None:
-        # Konstante: >= 200 in Vergleichsausdruck
+        # Constant: >= 200 in comparison expression
         if isinstance(node, ast.Compare):
             for comparator in node.comparators:
                 if isinstance(comparator, ast.Constant) and comparator.value in _SUSPICIOUS_VALUES:
                     lineno = getattr(node, "lineno", None)
                     line_text = lines[lineno - 1].strip() if lineno and lineno <= len(lines) else ""
-                    # Nur kritische Kontexte (len(), Indikator-Parameter)
-                    # HTTP-Statuscodes (status_code == 200) und Cache-Limits ausschließen
+                    # Exclude HTTP status codes and cache limits
                     if "status_code" in line_text or "cache" in line_text.lower():
+                        continue
+                    # Pagination: "if len(x) < N: break" or "while len(x) < N:"
+                    if "break" in line_text or line_text.strip().startswith("while"):
+                        continue
+                    # String truncation: "[:N]" or "truncat"
+                    if "[:" in line_text or "truncat" in line_text.lower():
+                        continue
+                    # Security input validation: return/raise after the check
+                    if any(kw in line_text for kw in ("return", "raise", "Error", "invalid")):
                         continue
                     if any(kw in line_text for kw in ("len(", "lookback", "period", "window")):
                         return self._make_finding(
                             severity="high",
                             file_path=rel_path,
                             line_number=lineno,
-                            description=f"Hardcoded Datenmenge-Check mit {comparator.value}",
+                            description=f"Hardcoded data-size check with {comparator.value}",
                             evidence=line_text,
                             suggested_fix=(
-                                f"Ersetze {comparator.value} durch konfigurierbare Konstante "
-                                f"(z.B. MIN_CANDLES = {comparator.value}) in config/strategy_config.json"
+                                f"Replace {comparator.value} with a configurable constant "
+                                f"(e.g. MIN_CANDLES = {comparator.value}) in strategy_config.json"
                             ),
                         )
 
-        # Keyword-Argument: lookback=200, period=200
+        # Keyword argument: lookback=200, period=200
         if isinstance(node, ast.keyword):
             if (
                 node.arg in ("lookback", "period", "window", "length", "timeperiod")
@@ -104,14 +112,19 @@ class DataBoundaryHunter(BaseHunter):
             ):
                 lineno = getattr(node, "lineno", None)
                 line_text = lines[lineno - 1].strip() if lineno and lineno <= len(lines) else ""
+                # Also exclude pagination / truncation / validation here
+                if any(kw in line_text for kw in ("break", "truncat", "return", "raise")):
+                    return None
+                if "[:" in line_text:
+                    return None
                 return self._make_finding(
                     severity="medium",
                     file_path=rel_path,
                     line_number=lineno,
-                    description=f"Hardcoded Indikator-Parameter {node.arg}={node.value.value}",
+                    description=f"Hardcoded indicator parameter {node.arg}={node.value.value}",
                     evidence=line_text,
                     suggested_fix=(
-                        f"Lese {node.arg} aus strategy_config.json statt hardcoded {node.value.value}"
+                        f"Read {node.arg} from strategy_config.json instead of hardcoded {node.value.value}"
                     ),
                 )
 

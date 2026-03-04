@@ -110,57 +110,131 @@ class CircularStateHunter(BaseHunter):
         return None
 
     # ------------------------------------------------------------------
-    # Code-Pattern Analyse
+    # Code-Pattern Analysis (Cross-File 2-Hop Graph)
     # ------------------------------------------------------------------
 
+    # Known state names in trading-bot context (adapt for your project)
+    _STATE_WRITERS = {"market_bias", "mcm_state", "density", "regime"}
+    _STATE_READERS = {"get_current_state", "get_mcm_state", "mcm_state", "market_bias"}
+
     def _scan_code_patterns(self, root: Path) -> list[BugFinding]:
-        """Sucht Code-Patterns die zirkuläre Abhängigkeiten erzeugen."""
+        """
+        Cross-file 2-hop graph: finds A->B->A cycles across multiple files.
+
+        Step 1: Which files write which state?
+        Step 2: Which files read that state AND write another?
+        Step 3: Is there an A->B->A cycle?
+        """
         findings: list[BugFinding] = []
-        # MCM-relevante Dateien prüfen
-        mcm_files = list(root.rglob("*market_condition*.py"))
-        analyzer_files = list(root.rglob("*analyzer*.py"))
-        for py_file in mcm_files + analyzer_files:
-            if self._should_skip(py_file, root):
+
+        # Build state map: {file: {reads: set, writes: set}}
+        file_states: dict[str, dict[str, set[str]]] = {}
+
+        py_files = [f for f in root.rglob("*.py") if not self._should_skip(f, root)]
+
+        for py_file in py_files:
+            try:
+                source = py_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
                 continue
-            findings.extend(self._check_circular_reads(py_file, root))
+            rel = str(py_file.relative_to(root))
+            reads: set[str] = set()
+            writes: set[str] = set()
+            for line in source.splitlines():
+                for reader in self._STATE_READERS:
+                    if reader in line:
+                        reads.add(reader)
+                for writer in self._STATE_WRITERS:
+                    if writer in line and "=" in line and "==" not in line and "#" not in line.split("=")[0]:
+                        writes.add(writer)
+            if reads or writes:
+                file_states[rel] = {"reads": reads, "writes": writes}
+
+        # Find cross-file A->B->A cycles
+        findings.extend(self._find_cross_file_cycles(file_states, root))
+
+        # Single-file circular state (read + write same variable)
+        for rel, states in file_states.items():
+            cross = states["reads"] & states["writes"]
+            if cross:
+                py_file = root / rel
+                findings.extend(self._check_single_file_circular(py_file, root, cross))
+
         return findings
 
-    def _check_circular_reads(self, path: Path, root: Path) -> list[BugFinding]:
-        """Prüft ob MCM-Output als eigener Input genutzt wird (A→B→A)."""
+    def _find_cross_file_cycles(
+        self,
+        file_states: dict[str, dict[str, set[str]]],
+        root: Path,
+    ) -> list[BugFinding]:
+        """Find A->B->A cycles in the cross-file state graph."""
+        findings: list[BugFinding] = []
+        files = list(file_states.keys())
+
+        for file_a in files:
+            writes_a = file_states[file_a]["writes"]
+            if not writes_a:
+                continue
+            for file_b in files:
+                if file_b == file_a:
+                    continue
+                reads_b = file_states[file_b]["reads"]
+                writes_b = file_states[file_b]["writes"]
+                shared_a_to_b = writes_a & reads_b
+                if not shared_a_to_b:
+                    continue
+                reads_a = file_states[file_a]["reads"]
+                shared_b_to_a = writes_b & reads_a
+                if not shared_b_to_a:
+                    continue
+                # Real cross-file cycle found
+                cycle_desc = (
+                    f"{file_a} writes {shared_a_to_b} -> "
+                    f"{file_b} reads + writes {shared_b_to_a} -> "
+                    f"{file_a} reads (A->B->A cycle)"
+                )
+                findings.append(self._make_finding(
+                    severity="high",
+                    file_path=file_a,
+                    line_number=None,
+                    description=f"Cross-file circular state: {cycle_desc}",
+                    evidence=f"A={file_a} <-> B={file_b} via {shared_a_to_b | shared_b_to_a}",
+                    suggested_fix=(
+                        "Separate read and write access to state variables into different layers. "
+                        "MCM should be READ-ONLY. State writes should be in a single central file."
+                    ),
+                ))
+        return findings
+
+    def _check_single_file_circular(
+        self, path: Path, root: Path, circular_states: set[str]
+    ) -> list[BugFinding]:
+        """Check single file for read+write of the same state variable."""
         findings: list[BugFinding] = []
         try:
             source = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             return findings
-
         rel_path = str(path.relative_to(root))
         lines = source.splitlines()
-
-        # Suche: MCM-State wird gelesen UND MCM wird danach direkt beeinflusst
-        reads_mcm = any("get_current_state" in line or "mcm_state" in line for line in lines)
-        writes_mcm = any("market_bias" in line and "=" in line for line in lines)
-
-        if reads_mcm and writes_mcm:
-            # Suche Zeile wo market_bias geschrieben wird
+        for state in circular_states:
             for i, line in enumerate(lines, 1):
-                if "market_bias" in line and "=" in line and "==" not in line:
+                if state in line and "=" in line and "==" not in line and "#" not in line.split("=")[0]:
                     findings.append(self._make_finding(
                         severity="medium",
                         file_path=rel_path,
                         line_number=i,
                         description=(
-                            "Möglicher Circular-State: MCM-State gelesen UND "
-                            "market_bias geschrieben in gleicher Datei → A→B→A Deadlock möglich"
+                            f"Possible circular state: '{state}' is read AND written "
+                            "in the same file -> A->B->A deadlock possible"
                         ),
                         evidence=line.strip(),
                         suggested_fix=(
-                            "Stelle sicher dass MCM-Reads und MCM-Writes "
-                            "nicht in einer Feedback-Schleife liegen. "
-                            "MCM sollte READ-ONLY sein (per CLAUDE.md)."
+                            "Ensure that state reads and writes are not in a feedback loop. "
+                            "MCM should be READ-ONLY."
                         ),
                     ))
-                    break  # Nur erste Fundstelle
-
+                    break  # Only first occurrence per state
         return findings
 
     def _should_skip(self, path: Path, root: Path) -> bool:

@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from core.base_hunter import BaseHunter, BugFinding
+from core.hunter_memory import HunterMemory
 from core.leaderboard import Leaderboard
 
 logger = logging.getLogger("bug_swarm.arena")
@@ -57,7 +58,9 @@ class BugHunterArena:
 
     def __init__(self, project_root: Path) -> None:
         self._root = project_root
-        self._leaderboard = Leaderboard(project_root / ".bug_hunters")
+        storage_dir = project_root / ".bug_hunters"
+        self._leaderboard = Leaderboard(storage_dir)
+        self._memory = HunterMemory(storage_dir)
 
     def run(
         self,
@@ -68,7 +71,11 @@ class BugHunterArena:
         t_start = time.time()
         logger.info("[ARENA] Starting with %d hunters, root=%s", len(hunters), self._root)
 
-        # Phase 1: Parallel hunt
+        # Phase 1: Set memory on each hunter (FP filter)
+        for h in hunters:
+            h.memory = self._memory
+
+        # Phase 1b: Parallel hunt
         all_findings = self._run_hunters_parallel(hunters)
         logger.info("[ARENA] %d raw findings collected", len(all_findings))
 
@@ -94,7 +101,17 @@ class BugHunterArena:
                 f.auto_fixed = True
                 self._leaderboard.award_auto_fixed(f.hunter_name)
 
+        # Phase 5: Store verdicts in memory
+        for f in all_findings:
+            verdict = "false_positive" if f.false_positive else "confirmed"
+            self._memory.remember_verdict(f, verdict)
+        self._memory.save()
+
         self._leaderboard.save()
+
+        lb_summary = self._leaderboard.format_top3()
+        mem_stats = self._memory.get_stats_summary()
+        combined_summary = f"{lb_summary}\n{mem_stats}"
 
         result = ArenaResult(
             total_findings=len(all_findings),
@@ -102,7 +119,7 @@ class BugHunterArena:
             false_positives=len(false_pos),
             unverified=len(unverified),
             proposals_written=proposals_written,
-            leaderboard_summary=self._leaderboard.format_top3(),
+            leaderboard_summary=combined_summary,
             findings=all_findings,
             duration_seconds=time.time() - t_start,
         )

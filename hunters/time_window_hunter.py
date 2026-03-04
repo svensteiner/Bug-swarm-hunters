@@ -130,22 +130,33 @@ class TimeWindowHunter(BaseHunter):
         return "\n".join(lines[start:end])
 
     def _assess_severity(self, line: str, context: str) -> tuple[str | None, str]:
-        """Bewertet Schwere. Gibt (severity, note) zurück, oder (None, '') wenn kein Bug."""
+        """Evaluate severity. Returns (severity, note) or (None, '') if not a bug."""
         line_lower = line.lower()
         ctx_lower = context.lower()
 
-        # Sehr langer Cooldown + Learning-Context = high
+        # DRY_RUN override already present → not a problem
+        if "DRY_RUN" in context or "dry_run" in context:
+            return None, ""
+
+        # Intentional daily/periodic checks → not a bug
+        if any(kw in ctx_lower for kw in ("health_check", "daily", "fhc", "once_per", "once_a_day")):
+            return None, ""
+
+        # Long cooldown + learning context = high
         if "86400" in line or "timedelta(hours=24" in line:
             if any(kw in ctx_lower for kw in ("evolution", "train", "retrain", "learn")):
-                return "high", "Evolution/Learning blockiert für 24h"
+                return "high", "Evolution/learning blocked for 24h"
             if any(kw in ctx_lower for kw in ("goal", "assess", "coach", "strategy")):
-                return "medium", "Goal/Strategy Assessment zu selten"
+                return "medium", "Goal/strategy assessment too infrequent"
             if any(kw in ctx_lower for kw in ("cooldown", "throttle", "last_")):
-                return "low", "Langer Cooldown — prüfen ob paper-trading-optimiert"
+                return "low", "Long cooldown — check if paper-trading-optimized"
 
-        # Noch längere Cooldowns
+        # Even longer cooldowns
         if "7 * 86400" in line or "604800" in line:
-            return "high", "7-Tage-Cooldown → fast kein Lernen im Paper-Trading"
+            # Bug hunt itself is intentionally weekly → not a bug
+            if "bug_hunt" in ctx_lower or "bug-hunt" in ctx_lower:
+                return None, ""
+            return "high", "7-day cooldown → almost no learning in paper-trading"
 
         return None, ""
 
