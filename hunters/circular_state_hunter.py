@@ -157,8 +157,25 @@ class CircularStateHunter(BaseHunter):
                     # Echter Assignment: writer\s*= (kein ==, !=, +=, in-String)
                     if f'"{writer}"' in stripped or f"'{writer}'" in stripped:
                         continue  # String-Literal → kein Write
-                    if _re.search(rf'\b{_re.escape(writer)}\s*=[^=]', stripped):
-                        writes.add(writer)
+                    # F-String-Interpolation: f"state={state}..." → kein Write
+                    if (f"{{{writer}" in stripped) or (f"={{{writer}}}" in stripped):
+                        continue
+                    # Lookahead statt [^=] damit m.end() direkt nach "=" zeigt
+                    m = _re.search(rf'\b{_re.escape(writer)}\s*=(?=[^=])', stripped)
+                    if not m:
+                        continue
+                    # Keyword-Argument: name=value, → kein Write (Zeichen vor Match = ( oder ,)
+                    before_match = stripped[:m.start()].rstrip()
+                    if before_match.endswith("(") or before_match.endswith(","):
+                        continue
+                    # Keyword-Argument alternativ: mcm_state=mcm_state, (gleicher Name)
+                    after_eq = stripped[m.end():].strip()
+                    if after_eq.startswith(writer):
+                        continue
+                    # Keyword-Argument: Zeile endet mit , und Wert enthält . (Attributzugriff)
+                    if stripped.rstrip().endswith(",") and "." in after_eq.split(",")[0]:
+                        continue
+                    writes.add(writer)
             if reads or writes:
                 file_states[rel] = {"reads": reads, "writes": writes}
 
@@ -245,23 +262,35 @@ class CircularStateHunter(BaseHunter):
                     continue
                 if f'"{state}"' in stripped_line or f"'{state}'" in stripped_line:
                     continue  # String-Literal → kein echter Write
-                if not _re.search(rf'\b{_re.escape(state)}\s*=[^=]', stripped_line):
+                if (f"{{{state}" in stripped_line) or (f"={{{state}}}" in stripped_line):
+                    continue  # F-String-Interpolation → kein Write
+                # Lookahead → m.end() direkt nach "="
+                m = _re.search(rf'\b{_re.escape(state)}\s*=(?=[^=])', stripped_line)
+                if not m:
+                    continue
+                # Keyword-Argument: Zeichen vor Match = ( oder , → kein Write
+                before_match = stripped_line[:m.start()].rstrip()
+                if before_match.endswith("(") or before_match.endswith(","):
+                    continue
+                after_eq = stripped_line[m.end():].strip()
+                if after_eq.startswith(state):
                     continue
                 findings.append(self._make_finding(
                     severity="medium",
                     file_path=rel_path,
                     line_number=i,
                     description=(
-                        f"Possible circular state: '{state}' is read AND written "
-                        "in the same file -> A->B->A deadlock possible"
+                        f"Möglicher Circular-State: '{state}' wird in gleicher Datei "
+                        "gelesen UND geschrieben → A→B→A Deadlock möglich"
                     ),
                     evidence=line.strip(),
                     suggested_fix=(
-                        "Ensure that state reads and writes are not in a feedback loop. "
-                        "MCM should be READ-ONLY."
+                        "Stelle sicher dass MCM-Reads und MCM-Writes "
+                        "nicht in einer Feedback-Schleife liegen. "
+                        "MCM sollte READ-ONLY sein (per CLAUDE.md)."
                     ),
                 ))
-                break  # Only first occurrence per state
+                break  # Nur erste Fundstelle pro State
         return findings
 
     def _should_skip(self, path: Path, root: Path) -> bool:
